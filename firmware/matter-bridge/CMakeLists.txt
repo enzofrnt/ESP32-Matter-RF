@@ -35,7 +35,7 @@ set(EXTRA_COMPONENT_DIRS
     ../components/cc1101
     ${extra_components_dirs_append})
 
-project(TX_MATTER)
+project(matter-bridge)
 
 idf_build_set_property(CXX_COMPILE_OPTIONS "-std=gnu++17;-Os;-DCHIP_HAVE_CONFIG_H;-fpermissive;-Wno-overloaded-virtual" APPEND)
 idf_build_set_property(C_COMPILE_OPTIONS "-Os" APPEND)
