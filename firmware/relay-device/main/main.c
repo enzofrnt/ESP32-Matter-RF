@@ -172,6 +172,16 @@ static void rx_task(void *pvParameter)
 
                     // Envoi de l'ACK avec l'état confirmé
                     send_ack(relay, relay_state[idx]);
+                }
+                // Expect "Q<digit>" - Query state command
+                else if (pkt.length >= 2 && pkt.data[0] == 'Q' && 
+                         pkt.data[1] >= '1' && pkt.data[1] <= '8') {
+                    uint8_t relay = (uint8_t)(pkt.data[1] - '0'); // 1..8
+                    int idx = (int)relay - 1;
+
+                    // Réponse avec l'état actuel du relais
+                    ESP_LOGI(TAG, "Query relay %u -> current state %u", relay, relay_state[idx]);
+                    send_ack(relay, relay_state[idx]);
                 } else {
                     ESP_LOGW(TAG, "Unknown command");
                 }
