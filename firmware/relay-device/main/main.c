@@ -6,6 +6,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #include "driver/gpio.h"
 
@@ -29,6 +31,62 @@ static const gpio_num_t relay_pins[8] = {
 };
 
 static uint8_t relay_state[8] = {0}; // 0=off, 1=on
+
+#define NVS_NAMESPACE "relay_states"
+#define NVS_KEY "states"
+
+static esp_err_t save_relay_states(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_blob(nvs_handle, NVS_KEY, relay_state, sizeof(relay_state));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error saving relay states: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error committing NVS: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Relay states saved to NVS");
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
+static esp_err_t restore_relay_states(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS namespace not found or error opening: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    size_t required_size = sizeof(relay_state);
+    err = nvs_get_blob(nvs_handle, NVS_KEY, relay_state, &required_size);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGI(TAG, "No saved relay states found, using defaults");
+        } else {
+            ESP_LOGE(TAG, "Error reading relay states: %s", esp_err_to_name(err));
+        }
+        nvs_close(nvs_handle);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Relay states restored from NVS");
+    nvs_close(nvs_handle);
+    return ESP_OK;
+}
 
 int rssi(char raw) {
     uint8_t rssi_dec;
@@ -58,10 +116,13 @@ static void relay_init(void)
 
     gpio_config(&io);
 
-    // Init OFF
+    // Restaurer les états depuis NVS
+    restore_relay_states();
+
+    // Appliquer les états restaurés (ou OFF par défaut si pas de sauvegarde)
     for (int i = 0; i < 8; i++) {
-        relay_state[i] = 0;
-        gpio_set_level(relay_pins[i], RELAY_OFF_LEVEL);
+        gpio_set_level(relay_pins[i], relay_state[i] ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
+        ESP_LOGI(TAG, "Relay %d initialized to state %u", i + 1, relay_state[i]);
     }
 }
 
@@ -106,6 +167,9 @@ static void rx_task(void *pvParameter)
 
                     ESP_LOGI(TAG, "Set relay %u -> %u", relay, relay_state[idx]);
 
+                    // Sauvegarder l'état dans NVS
+                    save_relay_states();
+
                     // Envoi de l'ACK avec l'état confirmé
                     send_ack(relay, relay_state[idx]);
                 } else {
@@ -121,6 +185,14 @@ static void rx_task(void *pvParameter)
 
 void app_main(void)
 {
+    // Initialiser NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
     relay_init();
 
     uint8_t freq;
@@ -145,7 +217,7 @@ void app_main(void)
     mode = CSPEED_38400;
 #endif
 
-    esp_err_t ret = init(freq, mode);
+    ret = init(freq, mode);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "CC1101 not installed");
         while (1) vTaskDelay(1);
