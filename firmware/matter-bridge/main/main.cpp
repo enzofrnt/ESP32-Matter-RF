@@ -78,16 +78,18 @@ static bool wait_for_ack(uint8_t relay_idx_1based, CCPACKET *out_pkt)
     return false; // Timeout
 }
 
-static void perform_rf_toggle(uint8_t relay_idx_1based, bool state)
+static void perform_rf_set_state(uint8_t relay_idx_1based, bool state)
 {
     CCPACKET pkt_tx;
     CCPACKET pkt_rx;
 
-    ESP_LOGI(TAG, "RF TASK: Sending toggle for Relay %d -> %d", relay_idx_1based, state);
+    ESP_LOGI(TAG, "RF TASK: Sending set state for Relay %d -> %d", relay_idx_1based, state);
 
-    pkt_tx.data[0] = 'T';
+    // Format: 'S' (Set) + digit (relay 1-8) + '0'/'1' (état cible)
+    pkt_tx.data[0] = 'S';
     pkt_tx.data[1] = (uint8_t)('0' + relay_idx_1based);
-    pkt_tx.length  = 2;
+    pkt_tx.data[2] = (uint8_t)(state ? '1' : '0');
+    pkt_tx.length  = 3;
 
     // Envoi de la donnée.
     // Note : Si sendData plante ici, c'est un problème matériel (GDO0 mal branché)
@@ -98,8 +100,13 @@ static void perform_rf_toggle(uint8_t relay_idx_1based, bool state)
     
     if (ok) {
         bool ack_state = (pkt_rx.data[3] == '1');
-        ESP_LOGI(TAG, "RF TASK: ACK OK. Relay %u confirmed %d (RSSI:%d)", 
+        ESP_LOGI(TAG, "RF TASK: ACK OK. Relay %u confirmed state %d (RSSI:%d)", 
                  relay_idx_1based, (int)ack_state, rssi(pkt_rx.rssi));
+        // Vérification que l'état confirmé correspond à l'état demandé
+        if (ack_state != state) {
+            ESP_LOGW(TAG, "RF TASK: State mismatch! Requested %d but got %d", 
+                     (int)state, (int)ack_state);
+        }
     } else {
         ESP_LOGW(TAG, "RF TASK: NO ACK for relay %u (Timeout)", relay_idx_1based);
     }
@@ -117,7 +124,7 @@ static void rf_worker_task(void *pvParameters)
         if (xQueueReceive(rf_command_queue, &cmd, portMAX_DELAY) == pdTRUE) {
             
             // Exécution de la commande RF
-            perform_rf_toggle(cmd.relay_idx_1based, cmd.state);
+            perform_rf_set_state(cmd.relay_idx_1based, cmd.state);
             
             // Petit délai supplémentaire pour la stabilité
             vTaskDelay(pdMS_TO_TICKS(50)); 

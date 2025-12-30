@@ -78,7 +78,7 @@ static void send_ack(uint8_t relay_idx_1based, uint8_t state)
 
 static void rx_task(void *pvParameter)
 {
-    ESP_LOGI(TAG, "Start RX task (waiting for toggle commands)");
+    ESP_LOGI(TAG, "Start RX task (waiting for set state commands)");
     CCPACKET pkt;
 
     while (1) {
@@ -92,16 +92,21 @@ static void rx_task(void *pvParameter)
                 ESP_LOGI(TAG, "RX packet len=%d rssi=%ddBm lqi=%d",
                          pkt.length, rssi(pkt.rssi), lqi(pkt.lqi));
 
-                // Expect "T<digit>"
-                if (pkt.length >= 2 && pkt.data[0] == 'T' && pkt.data[1] >= '1' && pkt.data[1] <= '8') {
+                // Expect "S<digit><0|1>" - Set state command
+                if (pkt.length >= 3 && pkt.data[0] == 'S' && 
+                    pkt.data[1] >= '1' && pkt.data[1] <= '8' &&
+                    (pkt.data[2] == '0' || pkt.data[2] == '1')) {
                     uint8_t relay = (uint8_t)(pkt.data[1] - '0'); // 1..8
+                    uint8_t target_state = (uint8_t)(pkt.data[2] - '0'); // 0 ou 1
                     int idx = (int)relay - 1;
 
-                    relay_state[idx] ^= 1;
+                    // Mise à jour directe de l'état (pas de toggle)
+                    relay_state[idx] = target_state;
                     gpio_set_level(relay_pins[idx], relay_state[idx] ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
 
-                    ESP_LOGI(TAG, "Toggle relay %u -> %u", relay, relay_state[idx]);
+                    ESP_LOGI(TAG, "Set relay %u -> %u", relay, relay_state[idx]);
 
+                    // Envoi de l'ACK avec l'état confirmé
                     send_ack(relay, relay_state[idx]);
                 } else {
                     ESP_LOGW(TAG, "Unknown command");
