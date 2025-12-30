@@ -1,0 +1,12 @@
+menu "Matter Bridge Configuration"
+
+    config SYNC_STATUS_INTERVAL_SEC
+        int "Intervalle de synchronisation du statut (secondes)"
+        range 5 300
+        default 30
+        help
+            Intervalle en secondes entre chaque demande de statut aux relais.
+            Permet de maintenir la synchronisation entre le bridge Matter et les relais.
+
+endmenu
+

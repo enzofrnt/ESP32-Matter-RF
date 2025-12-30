@@ -21,9 +21,14 @@ extern "C" {
 #include <esp_matter.h>
 #include <esp_matter_core.h>
 #include <esp_matter_endpoint.h>
+#include <esp_matter_attribute.h>
 
 #include <app/clusters/on-off-server/on-off-server.h>
 #include <app/server/Server.h>
+
+// --- AJOUT CRITIQUE POUR LE THREAD SAFETY ---
+#include <platform/CHIPDeviceLayer.h>
+// --------------------------------------------
 
 static const char *TAG = "TX_MATTER";
 
@@ -34,6 +39,10 @@ typedef struct {
 
 static QueueHandle_t rf_command_queue = NULL;
 static bool g_state[8] = {false};
+static uint16_t g_endpoint_ids[8] = {0};
+static uint8_t g_comm_failures[8] = {0}; // Compteur d'échecs consécutifs
+static bool g_relay_offline[8] = {false}; // État de communication (true = offline)
+#define MAX_COMM_FAILURES 3 // Nombre d'échecs avant de marquer comme offline
 
 // --- Utilitaires RF ---
 
@@ -46,62 +55,73 @@ static int rssi(char raw) {
 
 static bool wait_for_ack(uint8_t relay_idx_1based, CCPACKET *out_pkt)
 {
-    // On passe explicitement en mode réception
     setRxState();
-    
-    // Stratégie : On vérifie 20 fois avec une pause de 10ms.
-    // Total attente max = 200ms.
-    // L'utilisation de vTaskDelay permet aux tâches WiFi/Matter de s'exécuter.
-    const int max_retries = 20;
+    const int max_retries = 15; // Réduit de 20 à 15 pour réduire le timeout max (150ms au lieu de 200ms)
 
     for (int i = 0; i < max_retries; i++) {
+        // Réinitialiser le watchdog à CHAQUE itération pour éviter les timeouts
+        esp_task_wdt_reset();
+        taskYIELD(); // Forcer le changement de contexte à chaque itération
         
-        // On regarde si le CC1101 a reçu quelque chose dans son buffer
         if (packet_available()) {
             if (receiveData(out_pkt) > 0) {
                 if (out_pkt->crc_ok) {
-                    // Vérification du format du paquet
                     if (out_pkt->length >= 4 && out_pkt->data[0] == 'A') {
                         uint8_t got = (uint8_t)(out_pkt->data[1] - '0');
                         if (got == relay_idx_1based) {
-                            return true; // Succès !
+                            esp_task_wdt_reset(); // Réinitialiser avant de retourner
+                            return true;
                         }
                     }
                 }
             }
         }
-        
-        // CRUCIAL : On rend la main à l'OS. Le Watchdog est content.
         vTaskDelay(pdMS_TO_TICKS(10)); 
     }
-    
-    return false; // Timeout
+    esp_task_wdt_reset(); // Réinitialiser avant de retourner false
+    return false;
 }
 
 static void perform_rf_set_state(uint8_t relay_idx_1based, bool state)
 {
+    int idx = (int)relay_idx_1based - 1;
+    
+    // Vérifier si le relais est marqué comme offline
+    if (g_relay_offline[idx]) {
+        ESP_LOGE(TAG, "RF TASK: Relay %u is OFFLINE - command blocked!", relay_idx_1based);
+        return;
+    }
+    
     CCPACKET pkt_tx;
     CCPACKET pkt_rx;
 
     ESP_LOGI(TAG, "RF TASK: Sending set state for Relay %d -> %d", relay_idx_1based, state);
 
-    // Format: 'S' (Set) + digit (relay 1-8) + '0'/'1' (état cible)
     pkt_tx.data[0] = 'S';
     pkt_tx.data[1] = (uint8_t)('0' + relay_idx_1based);
     pkt_tx.data[2] = (uint8_t)(state ? '1' : '0');
     pkt_tx.length  = 3;
 
-    // Envoi de la donnée.
-    // Note : Si sendData plante ici, c'est un problème matériel (GDO0 mal branché)
+    // Réinitialiser le watchdog avant l'opération RF
+    esp_task_wdt_reset();
     sendData(pkt_tx);
+    // Réinitialiser immédiatement après sendData (peut bloquer)
+    esp_task_wdt_reset();
+    taskYIELD(); // Forcer le changement de contexte après sendData
 
-    // Attente de la réponse de manière non bloquante pour l'OS
     bool ok = wait_for_ack(relay_idx_1based, &pkt_rx);
+    
+    // Réinitialiser après wait_for_ack
+    esp_task_wdt_reset();
     
     if (ok) {
         bool ack_state = (pkt_rx.data[3] == '1');
         ESP_LOGI(TAG, "RF TASK: ACK OK. Relay %u confirmed state %d (RSSI:%d)", 
                  relay_idx_1based, (int)ack_state, rssi(pkt_rx.rssi));
+        // Communication réussie : réinitialiser le compteur d'échecs
+        g_comm_failures[idx] = 0;
+        g_relay_offline[idx] = false;
+        
         // Vérification que l'état confirmé correspond à l'état demandé
         if (ack_state != state) {
             ESP_LOGW(TAG, "RF TASK: State mismatch! Requested %d but got %d", 
@@ -109,6 +129,187 @@ static void perform_rf_set_state(uint8_t relay_idx_1based, bool state)
         }
     } else {
         ESP_LOGW(TAG, "RF TASK: NO ACK for relay %u (Timeout)", relay_idx_1based);
+        g_comm_failures[idx]++;
+        
+        // Marquer comme offline après plusieurs échecs
+        if (g_comm_failures[idx] >= MAX_COMM_FAILURES) {
+            g_relay_offline[idx] = true;
+            ESP_LOGE(TAG, "RF TASK: Relay %u marked as OFFLINE after %d failures!", 
+                     relay_idx_1based, g_comm_failures[idx]);
+        }
+    }
+}
+
+// Fonction pour corriger directement l'état d'un relais (utilisée par sync_status_task)
+// Retourne true si la commande a réussi, false sinon
+static bool sync_correct_relay_state(uint8_t relay_idx_1based, bool target_state)
+{
+    int idx = (int)relay_idx_1based - 1;
+    CCPACKET pkt_tx;
+    CCPACKET pkt_rx;
+
+    ESP_LOGI(TAG, "SYNC: Correcting relay %d to state %d", relay_idx_1based, (int)target_state);
+
+    pkt_tx.data[0] = 'S';
+    pkt_tx.data[1] = (uint8_t)('0' + relay_idx_1based);
+    pkt_tx.data[2] = (uint8_t)(target_state ? '1' : '0');
+    pkt_tx.length  = 3;
+
+    // Réinitialiser le watchdog avant l'opération RF
+    esp_task_wdt_reset();
+    sendData(pkt_tx);
+    // Réinitialiser immédiatement après sendData (peut bloquer)
+    esp_task_wdt_reset();
+    taskYIELD(); // Forcer le changement de contexte après sendData
+
+    bool ok = wait_for_ack(relay_idx_1based, &pkt_rx);
+    
+    // Réinitialiser après wait_for_ack
+    esp_task_wdt_reset();
+    
+    if (ok) {
+        bool ack_state = (pkt_rx.data[3] == '1');
+        ESP_LOGI(TAG, "SYNC: Correction successful! Relay %u confirmed state %d (RSSI:%d)", 
+                 relay_idx_1based, (int)ack_state, rssi(pkt_rx.rssi));
+        // Communication réussie : réinitialiser le compteur d'échecs
+        g_comm_failures[idx] = 0;
+        g_relay_offline[idx] = false;
+        
+        // Mettre à jour g_state avec l'état confirmé (devrait correspondre à target_state)
+        // Si ack_state != target_state, on utilise quand même ack_state car c'est l'état réel
+        g_state[idx] = ack_state;
+        
+        // Vérifier que l'état confirmé correspond à l'état demandé
+        if (ack_state != target_state) {
+            ESP_LOGW(TAG, "SYNC: Warning! Requested state %d but relay confirmed %d", 
+                     (int)target_state, (int)ack_state);
+        }
+        
+        return true;
+    } else {
+        ESP_LOGW(TAG, "SYNC: Correction FAILED for relay %u (Timeout)", relay_idx_1based);
+        g_comm_failures[idx]++;
+        
+        // Marquer comme offline après plusieurs échecs
+        if (g_comm_failures[idx] >= MAX_COMM_FAILURES) {
+            if (!g_relay_offline[idx]) {
+                g_relay_offline[idx] = true;
+                ESP_LOGE(TAG, "SYNC: Relay %u marked as OFFLINE after %d failures!", 
+                         relay_idx_1based, g_comm_failures[idx]);
+            }
+        }
+        return false;
+    }
+}
+
+static bool query_rf_relay_state(uint8_t relay_idx_1based, bool *out_state)
+{
+    int idx = (int)relay_idx_1based - 1;
+    CCPACKET pkt_tx;
+    CCPACKET pkt_rx;
+
+    ESP_LOGI(TAG, "SYNC: Querying state for Relay %d", relay_idx_1based);
+
+    pkt_tx.data[0] = 'Q';
+    pkt_tx.data[1] = (uint8_t)('0' + relay_idx_1based);
+    pkt_tx.length  = 2;
+
+    // Réinitialiser le watchdog avant l'opération RF
+    esp_task_wdt_reset();
+    sendData(pkt_tx);
+    // Réinitialiser immédiatement après sendData (peut bloquer)
+    esp_task_wdt_reset();
+    taskYIELD(); // Forcer le changement de contexte après sendData
+
+    bool ok = wait_for_ack(relay_idx_1based, &pkt_rx);
+    
+    // Réinitialiser après wait_for_ack
+    esp_task_wdt_reset();
+    
+    if (ok) {
+        bool relay_state = (pkt_rx.data[3] == '1');
+        *out_state = relay_state;
+        ESP_LOGI(TAG, "SYNC: Relay %u state = %d (RSSI:%d)", 
+                 relay_idx_1based, (int)relay_state, rssi(pkt_rx.rssi));
+        // Communication réussie : réinitialiser le compteur d'échecs
+        g_comm_failures[idx] = 0;
+        g_relay_offline[idx] = false;
+        return true;
+    } else {
+        ESP_LOGW(TAG, "SYNC: NO ACK for relay %u query (Timeout)", relay_idx_1based);
+        g_comm_failures[idx]++;
+        
+        // Marquer comme offline après plusieurs échecs
+        if (g_comm_failures[idx] >= MAX_COMM_FAILURES) {
+            if (!g_relay_offline[idx]) {
+                g_relay_offline[idx] = true;
+                ESP_LOGE(TAG, "SYNC: Relay %u marked as OFFLINE after %d consecutive failures!", 
+                         relay_idx_1based, g_comm_failures[idx]);
+            }
+        }
+        return false;
+    }
+}
+
+// --- Mise à jour de l'état Matter avec remontée vers Home Assistant ---
+// Cette fonction suit les bonnes pratiques Matter :
+// 1. Vérifie si l'état a vraiment changé avant de mettre à jour (évite les boucles)
+// 2. Met à jour g_state AVANT d'appeler attribute::update
+// 3. Utilise le verrouillage Matter Stack pour thread safety
+// 4. Home Assistant reçoit automatiquement la notification via subscription Matter
+static void update_matter_state(uint8_t relay_idx_0based, bool state)
+{
+    if (relay_idx_0based >= 8) return;
+
+    uint16_t endpoint_id = g_endpoint_ids[relay_idx_0based];
+    if (endpoint_id == 0) {
+        ESP_LOGW(TAG, "SYNC: Endpoint ID not set for relay %d", relay_idx_0based + 1);
+        return;
+    }
+
+    // BONNE PRATIQUE : Vérifier si l'état a vraiment changé avant de mettre à jour
+    // Cela évite d'envoyer des notifications inutiles et des boucles infinies
+    if (g_state[relay_idx_0based] == state) {
+        // État déjà à jour, pas besoin de mettre à jour Matter
+        return;
+    }
+
+    // Mise à jour de la copie locale AVANT d'appeler attribute::update
+    // Cela garantit que le callback PRE_UPDATE ne déclenchera pas de commande RF
+    // car g_state[idx] == desired sera vrai
+    g_state[relay_idx_0based] = state;
+
+    // Préparer la valeur de l'attribut
+    esp_matter_attr_val_t val;
+    memset(&val, 0, sizeof(esp_matter_attr_val_t));
+    val.type = 0x10; // ZCL Boolean (type standard pour les attributs booléens Matter)
+    val.val.b = state;
+    
+    // --- VERROUILLAGE DU STACK MATTER (Thread Safety) ---
+    // CRITIQUE : Toute interaction avec Matter doit se faire depuis le thread Matter
+    // Cela garantit que Home Assistant reçoit la notification correctement
+    // PlatformMgr().LockChipStack() est équivalent à ScopedChipStackLock mais manuel
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+    
+    // Mise à jour de l'attribut OnOff dans Matter
+    // Cela déclenche automatiquement une notification (report) vers Home Assistant
+    esp_err_t err = esp_matter::attribute::update(
+        endpoint_id,
+        chip::app::Clusters::OnOff::Id,
+        chip::app::Clusters::OnOff::Attributes::OnOff::Id,
+        &val
+    );
+    
+    // Libération du verrou : Matter se réveille et envoie la notification
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+    // ------------------------------------
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "SYNC: Updated Matter state for relay %d (endpoint %d) -> %d (Home Assistant will be notified)", 
+                 relay_idx_0based + 1, endpoint_id, (int)state);
+    } else {
+        ESP_LOGE(TAG, "SYNC: Failed to update Matter state: %s", esp_err_to_name(err));
+        // En cas d'erreur, on pourrait restaurer g_state, mais généralement on laisse tel quel
     }
 }
 
@@ -116,29 +317,33 @@ static void perform_rf_set_state(uint8_t relay_idx_1based, bool state)
 static void rf_worker_task(void *pvParameters)
 {
     rf_command_t cmd;
-    
     ESP_LOGI(TAG, "RF Worker Task Started");
 
+    // S'abonner au watchdog pour permettre l'appel de perform_rf_set_state qui contient des resets
+    esp_task_wdt_add(NULL);
+
     while (1) {
-        // Attente bloquante d'un message dans la queue (consomme 0% CPU)
-        if (xQueueReceive(rf_command_queue, &cmd, portMAX_DELAY) == pdTRUE) {
-            
-            // Exécution de la commande RF
+        // Reset du watchdog à chaque tour de boucle
+        esp_task_wdt_reset();
+
+        // On attend une commande. Note: xQueueReceive avec portMAX_DELAY peut bloquer indéfiniment.
+        // Pour ne pas déclencher le watchdog pendant l'attente, on utilise un timeout
+        // et on boucle pour reset le watchdog.
+        if (xQueueReceive(rf_command_queue, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            // Commande reçue, on l'exécute (les resets internes à perform_rf_set_state fonctionneront)
             perform_rf_set_state(cmd.relay_idx_1based, cmd.state);
-            
-            // Petit délai supplémentaire pour la stabilité
             vTaskDelay(pdMS_TO_TICKS(50)); 
         }
     }
 }
 
 // --- Callbacks Matter ---
-
 static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t type,
                                         uint16_t endpoint_id, uint32_t cluster_id,
                                         uint32_t attribute_id, esp_matter_attr_val_t *val,
                                         void *priv_data)
 {
+    // On ne s'intéresse qu'à la phase PRE_UPDATE pour intercepter
     if (type != esp_matter::attribute::PRE_UPDATE) {
         return ESP_OK;
     }
@@ -150,19 +355,29 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
         if (idx >= 0 && idx < 8) {
             bool desired = val->val.b;
             
-            // On envoie la commande seulement si l'état change
-            // (Matter envoie parfois des mises à jour redondantes)
+            // Vérifier si le relais est offline - bloquer la commande
+            if (g_relay_offline[idx]) {
+                ESP_LOGE(TAG, "COMM ERROR: Relay %d is OFFLINE - command rejected! Communication failed.", idx + 1);
+                // Rejeter la commande en restaurant l'ancienne valeur
+                val->val.b = g_state[idx];
+                return ESP_ERR_INVALID_STATE;
+            }
+            
+            // Cette condition est CRUCIALE pour éviter la boucle infinie
+            // Quand update_matter_state() est appelé, g_state est déjà mis à jour,
+            // donc on n'entre PAS ici.
             if (g_state[idx] != desired) {
                 rf_command_t cmd;
                 cmd.relay_idx_1based = (uint8_t)(idx + 1);
                 cmd.state = desired;
 
-                // Envoi à la queue (timeout 0 pour ne jamais bloquer Matter)
                 if (xQueueSend(rf_command_queue, &cmd, 0) != pdTRUE) {
                     ESP_LOGE(TAG, "RF Queue full! Dropping command");
                 } else {
                     ESP_LOGI(TAG, "Queued RF command for Relay %d", cmd.relay_idx_1based);
                 }
+                
+                // On met à jour l'état local immédiatement
                 g_state[idx] = desired;
             }
         }
@@ -184,7 +399,79 @@ static void app_event_cb(const chip::DeviceLayer::ChipDeviceEvent *event, intptr
     }
 }
 
-// --- Bouton Factory Reset ---
+// --- Tâche de synchronisation périodique ---
+// --- Tâche de synchronisation périodique ---
+static void sync_status_task(void *pvParameters)
+{
+    int sync_interval_sec = 30;
+    ESP_LOGI(TAG, "Sync Status Task Started (interval: %d seconds)", sync_interval_sec);
+
+    // 1. D'ABORD on attend que le système se stabilise (Wi-Fi, Matter, etc.)
+    // On ne s'enregistre PAS encore au watchdog ici, car on va dormir 5s.
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // 2. MAINTENANT on s'abonne au watchdog, juste avant d'entrer dans la boucle de travail
+    esp_task_wdt_add(NULL);
+
+    while (1) {
+        // Réinitialiser le watchdog au début de chaque cycle
+        esp_task_wdt_reset();
+        
+        for (int i = 0; i < 8; i++) {
+            uint8_t relay_idx_1based = (uint8_t)(i + 1);
+            bool actual_state;
+
+            // Réinitialiser le watchdog avant chaque opération RF
+            esp_task_wdt_reset();
+            
+            // On vérifie l'état réel via RF
+            if (query_rf_relay_state(relay_idx_1based, &actual_state)) {
+                
+                // Gestion du retour en ligne
+                if (g_relay_offline[i]) {
+                    ESP_LOGI(TAG, "SYNC: Relay %d is back ONLINE!", relay_idx_1based);
+                    g_relay_offline[i] = false;
+                }
+                
+                // Si différence avec Matter
+                if (g_state[i] != actual_state) {
+                    ESP_LOGW(TAG, "SYNC: Mismatch detected! Relay %d: Matter=%d, Relay=%d. Attempting correction...", 
+                             relay_idx_1based, (int)g_state[i], (int)actual_state);
+                    
+                    esp_task_wdt_reset();
+                    
+                    // Tentative de correction
+                    bool correction_success = sync_correct_relay_state(relay_idx_1based, g_state[i]);
+                    
+                    esp_task_wdt_reset();
+                    
+                    if (correction_success) {
+                        ESP_LOGI(TAG, "SYNC: Relay %d successfully corrected", relay_idx_1based);
+                    } else {
+                        ESP_LOGE(TAG, "SYNC: Correction failed for relay %d. Updating Matter UI instead.", relay_idx_1based);
+                        update_matter_state(i, actual_state);
+                    }
+                }
+            }
+            
+            // Petit délai entre les relais pour laisser respirer le CPU et le RF
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        // Attente longue : On doit gérer le watchdog ici aussi si l'intervalle > 5s
+        // Le vTaskDelay bloque la tâche, donc on ne peut pas reset pendant ce temps.
+        // Solution : Soit on se désabonne temporairement, soit on boucle.
+        // Voici la méthode propre "boucle" pour garder la surveillance :
+        
+        int elapsed = 0;
+        while (elapsed < sync_interval_sec * 1000) {
+            vTaskDelay(pdMS_TO_TICKS(1000)); // On dort par tranches de 1s
+            esp_task_wdt_reset();           // On nourrit le chien
+            elapsed += 1000;
+        }
+    }
+}
+
 static void factory_reset_button_task(void *pvParameters)
 {
     gpio_reset_pin(GPIO_NUM_0);
@@ -211,7 +498,6 @@ static void factory_reset_button_task(void *pvParameters)
 
 static esp_err_t init_cc1101_from_kconfig(void)
 {
-    // Configuration identique
     uint8_t freq = CFREQ_433;
     uint8_t mode = CSPEED_38400;
 
@@ -228,7 +514,7 @@ static esp_err_t init_cc1101_from_kconfig(void)
 #elif defined(CONFIG_CC1101_SPEED_19200)
     mode = CSPEED_19200;
 #endif
-
+ 
     esp_err_t ret = init(freq, mode);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "CC1101 init failed");
@@ -252,32 +538,55 @@ extern "C" void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition was truncated and needs to be erased");
         nvs_flash_erase();
-        nvs_flash_init();
+        ret = nvs_flash_init();
     }
+    ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     rf_command_queue = xQueueCreate(10, sizeof(rf_command_t));
 
-    if (init_cc1101_from_kconfig() == ESP_OK) {
-        // Priorité 5 : Plus haute que Matter, mais grâce aux vTaskDelay,
-        // on ne tue pas le système.
+    bool cc1101_initialized = (init_cc1101_from_kconfig() == ESP_OK);
+    if (cc1101_initialized) {
         xTaskCreate(rf_worker_task, "rf_worker", 4096, NULL, 5, NULL);
     }
 
     esp_matter::node::config_t node_config;
     esp_matter::node_t *node = esp_matter::node::create(&node_config, app_attribute_update_cb, nullptr);
+    if (node == nullptr) {
+        ESP_LOGE(TAG, "Failed to create Matter node!");
+        return;
+    }
     
     for (int i = 0; i < 8; i++) {
         esp_matter::endpoint::on_off_light::config_t ep_cfg;
         ep_cfg.on_off.on_off = false;
-        esp_matter::endpoint::on_off_light::create(node, &ep_cfg, esp_matter::ENDPOINT_FLAG_NONE, (void *)(intptr_t)i);
+        esp_matter::endpoint_t *endpoint = esp_matter::endpoint::on_off_light::create(node, &ep_cfg, esp_matter::ENDPOINT_FLAG_NONE, (void *)(intptr_t)i);
+        if (endpoint != nullptr) {
+            g_endpoint_ids[i] = esp_matter::endpoint::get_id(endpoint);
+            ESP_LOGI(TAG, "Created endpoint %d for relay %d", g_endpoint_ids[i], i + 1);
+        }
     }
 
-    esp_matter::start(app_event_cb);
+    // Vérifier le retour de esp_matter::start()
+    ret = esp_matter::start(app_event_cb);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Matter start failed: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGE(TAG, "This might be due to corrupted NVS. Try factory reset or erase NVS partition.");
+        // Le système peut continuer en mode RF-only mais Matter ne fonctionnera pas
+        ESP_LOGW(TAG, "Continuing in RF-only mode (Matter disabled)");
+    } else {
+        ESP_LOGI(TAG, "Matter started successfully");
+    }
+    
     xTaskCreate(factory_reset_button_task, "factory_reset", 3072, NULL, 2, NULL);
+    
+    if (cc1101_initialized) {
+        xTaskCreate(sync_status_task, "sync_status", 4096, NULL, 3, NULL);
+    }
     
     ESP_LOGI(TAG, "System Started");
 }
