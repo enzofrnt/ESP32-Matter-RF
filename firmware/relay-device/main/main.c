@@ -32,6 +32,7 @@ static const gpio_num_t relay_pins[8] = {
 
 static uint8_t relay_state[8] = {0}; // 0=off, 1=on
 
+
 #define NVS_NAMESPACE "relay_states"
 #define NVS_KEY "states"
 
@@ -137,6 +138,7 @@ static void send_ack(uint8_t relay_idx_1based, uint8_t state)
     sendData(ack);
 }
 
+
 static void rx_task(void *pvParameter)
 {
     ESP_LOGI(TAG, "Start RX task (waiting for set state commands)");
@@ -152,6 +154,7 @@ static void rx_task(void *pvParameter)
 
                 ESP_LOGI(TAG, "RX packet len=%d rssi=%ddBm lqi=%d",
                          pkt.length, rssi(pkt.rssi), lqi(pkt.lqi));
+                
 
                 // Expect "S<digit><0|1>" - Set state command
                 if (pkt.length >= 3 && pkt.data[0] == 'S' && 
@@ -183,7 +186,10 @@ static void rx_task(void *pvParameter)
                     ESP_LOGI(TAG, "Query relay %u -> current state %u", relay, relay_state[idx]);
                     send_ack(relay, relay_state[idx]);
                 } else {
-                    ESP_LOGW(TAG, "Unknown command");
+                    ESP_LOGW(TAG, "Unknown command: len=%d, data[0]=0x%02x('%c')", 
+                             pkt.length, 
+                             pkt.data[0],
+                             (pkt.data[0] >= 32 && pkt.data[0] < 127) ? pkt.data[0] : '?');
                 }
             }
         }
@@ -192,6 +198,7 @@ static void rx_task(void *pvParameter)
 
     vTaskDelete(NULL);
 }
+
 
 void app_main(void)
 {
@@ -204,6 +211,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     relay_init();
+
 
     uint8_t freq;
 #if CONFIG_CC1101_FREQ_315
@@ -247,4 +255,5 @@ void app_main(void)
 #endif
 
     xTaskCreate(&rx_task, "RX", 4096, NULL, 5, NULL);
+    
 }
