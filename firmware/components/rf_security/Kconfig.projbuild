@@ -1,0 +1,13 @@
+menu "RF Security Configuration"
+
+    config RF_AES_KEY
+        string "Clé AES-128 (32 caractères hexadécimaux = 16 bytes)"
+        default "00112233445566778899AABBCCDDEEFF"
+        help
+            Clé AES-128 en hexadécimal (exactement 32 caractères).
+            Exemple: 00112233445566778899AABBCCDDEEFF
+            DOIT être identique sur bridge et relais pour que la communication fonctionne.
+            Changez cette valeur pour chaque installation pour éviter les interférences.
+
+endmenu
+

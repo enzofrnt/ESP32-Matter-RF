@@ -16,6 +16,7 @@
 
 extern "C" {
 #include <cc1101.h>
+#include "rf_security.h"
 }
 
 #include <esp_matter.h>
@@ -42,6 +43,7 @@ static bool g_state[8] = {false};
 static uint16_t g_endpoint_ids[8] = {0};
 static uint8_t g_comm_failures[8] = {0}; // Compteur d'échecs consécutifs
 static bool g_relay_offline[8] = {false}; // État de communication (true = offline)
+static bool g_rf_security_initialized = false;
 #define MAX_COMM_FAILURES 3 // Nombre d'échecs avant de marquer comme offline
 
 // --- Utilitaires RF ---
@@ -66,8 +68,38 @@ static bool wait_for_ack(uint8_t relay_idx_1based, CCPACKET *out_pkt)
         if (packet_available()) {
             if (receiveData(out_pkt) > 0) {
                 if (out_pkt->crc_ok) {
-                    if (out_pkt->length >= 4 && out_pkt->data[0] == 'A') {
-                        uint8_t got = (uint8_t)(out_pkt->data[1] - '0');
+                    // Vérifier la taille minimale : IV (12) + Tag (16) + min data (4)
+                    if (out_pkt->length < 12 + 16 + 4) {
+                        continue;
+                    }
+                    
+                    // Extraire IV, Tag et Ciphertext
+                    uint8_t *iv = out_pkt->data;
+                    uint8_t *tag = out_pkt->data + 12;
+                    uint8_t *ciphertext = out_pkt->data + 12 + 16;
+                    size_t ciphertext_len = out_pkt->length - 12 - 16;
+                    
+                    // Déchiffrer dans un buffer temporaire
+                    uint8_t plaintext[64];
+                    size_t plaintext_len;
+                    
+                    esp_err_t ret = rf_security_decrypt(ciphertext, ciphertext_len,
+                                                       iv, tag, plaintext, &plaintext_len);
+                    if (ret != ESP_OK) {
+                        ESP_LOGW(TAG, "RF TASK: Decryption failed or invalid auth!");
+                        continue;
+                    }
+                    
+                    // Copier les données déchiffrées dans out_pkt pour compatibilité
+                    // (les fonctions appelantes s'attendent à trouver les données en clair)
+                    if (plaintext_len <= sizeof(out_pkt->data)) {
+                        memcpy(out_pkt->data, plaintext, plaintext_len);
+                        out_pkt->length = plaintext_len;
+                    }
+                    
+                    // Vérifier le contenu déchiffré
+                    if (plaintext_len >= 4 && plaintext[0] == 'A') {
+                        uint8_t got = (uint8_t)(plaintext[1] - '0');
                         if (got == relay_idx_1based) {
                             esp_task_wdt_reset(); // Réinitialiser avant de retourner
                             return true;
@@ -97,10 +129,31 @@ static void perform_rf_set_state(uint8_t relay_idx_1based, bool state)
 
     ESP_LOGI(TAG, "RF TASK: Sending set state for Relay %d -> %d", relay_idx_1based, state);
 
-    pkt_tx.data[0] = 'S';
-    pkt_tx.data[1] = (uint8_t)('0' + relay_idx_1based);
-    pkt_tx.data[2] = (uint8_t)(state ? '1' : '0');
-    pkt_tx.length  = 3;
+    // Préparer le paquet en clair
+    uint8_t plaintext[3];
+    plaintext[0] = 'S';
+    plaintext[1] = (uint8_t)('0' + relay_idx_1based);
+    plaintext[2] = (uint8_t)(state ? '1' : '0');
+
+    // Chiffrer le paquet avec AES-128-GCM
+    uint8_t ciphertext[16];  // Taille max pour 3 bytes de plaintext
+    uint8_t iv[12];
+    uint8_t tag[16];
+    size_t ciphertext_len;
+
+    esp_task_wdt_reset();
+    esp_err_t ret = rf_security_encrypt(plaintext, 3, ciphertext, &ciphertext_len, iv, tag);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "RF TASK: Encryption failed!");
+        return;
+    }
+
+    // Construire le paquet final : IV (12) + Tag (16) + Ciphertext (3)
+    // Format: [IV:12 bytes][Tag:16 bytes][Ciphertext:variable]
+    memcpy(pkt_tx.data, iv, 12);
+    memcpy(pkt_tx.data + 12, tag, 16);
+    memcpy(pkt_tx.data + 12 + 16, ciphertext, ciphertext_len);
+    pkt_tx.length = 12 + 16 + ciphertext_len;  // Total: 31 bytes
 
     // Réinitialiser le watchdog avant l'opération RF
     esp_task_wdt_reset();
@@ -115,9 +168,11 @@ static void perform_rf_set_state(uint8_t relay_idx_1based, bool state)
     esp_task_wdt_reset();
     
     if (ok) {
+        // Le paquet ACK est déjà déchiffré dans wait_for_ack
+        // pkt_rx.data contient maintenant les données en clair
         bool ack_state = (pkt_rx.data[3] == '1');
-        ESP_LOGI(TAG, "RF TASK: ACK OK. Relay %u confirmed state %d (RSSI:%d)", 
-                 relay_idx_1based, (int)ack_state, rssi(pkt_rx.rssi));
+        ESP_LOGI(TAG, "RF TASK: ACK OK. Relay %u confirmed state %d", 
+                 relay_idx_1based, (int)ack_state);
         // Communication réussie : réinitialiser le compteur d'échecs
         g_comm_failures[idx] = 0;
         g_relay_offline[idx] = false;
@@ -150,10 +205,30 @@ static bool sync_correct_relay_state(uint8_t relay_idx_1based, bool target_state
 
     ESP_LOGI(TAG, "SYNC: Correcting relay %d to state %d", relay_idx_1based, (int)target_state);
 
-    pkt_tx.data[0] = 'S';
-    pkt_tx.data[1] = (uint8_t)('0' + relay_idx_1based);
-    pkt_tx.data[2] = (uint8_t)(target_state ? '1' : '0');
-    pkt_tx.length  = 3;
+    // Préparer le paquet en clair
+    uint8_t plaintext[3];
+    plaintext[0] = 'S';
+    plaintext[1] = (uint8_t)('0' + relay_idx_1based);
+    plaintext[2] = (uint8_t)(target_state ? '1' : '0');
+
+    // Chiffrer
+    uint8_t ciphertext[16];
+    uint8_t iv[12];
+    uint8_t tag[16];
+    size_t ciphertext_len;
+
+    esp_task_wdt_reset();
+    esp_err_t ret = rf_security_encrypt(plaintext, 3, ciphertext, &ciphertext_len, iv, tag);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SYNC: Encryption failed!");
+        return false;
+    }
+
+    // Construire le paquet
+    memcpy(pkt_tx.data, iv, 12);
+    memcpy(pkt_tx.data + 12, tag, 16);
+    memcpy(pkt_tx.data + 12 + 16, ciphertext, ciphertext_len);
+    pkt_tx.length = 12 + 16 + ciphertext_len;
 
     // Réinitialiser le watchdog avant l'opération RF
     esp_task_wdt_reset();
@@ -169,14 +244,11 @@ static bool sync_correct_relay_state(uint8_t relay_idx_1based, bool target_state
     
     if (ok) {
         bool ack_state = (pkt_rx.data[3] == '1');
-        ESP_LOGI(TAG, "SYNC: Correction successful! Relay %u confirmed state %d (RSSI:%d)", 
-                 relay_idx_1based, (int)ack_state, rssi(pkt_rx.rssi));
+        ESP_LOGI(TAG, "SYNC: Correction successful! Relay %u confirmed state %d", 
+                 relay_idx_1based, (int)ack_state);
         // Communication réussie : réinitialiser le compteur d'échecs
         g_comm_failures[idx] = 0;
         g_relay_offline[idx] = false;
-        
-        // Mettre à jour g_state avec l'état confirmé (devrait correspondre à target_state)
-        // Si ack_state != target_state, on utilise quand même ack_state car c'est l'état réel
         g_state[idx] = ack_state;
         
         // Vérifier que l'état confirmé correspond à l'état demandé
@@ -210,9 +282,29 @@ static bool query_rf_relay_state(uint8_t relay_idx_1based, bool *out_state)
 
     ESP_LOGI(TAG, "SYNC: Querying state for Relay %d", relay_idx_1based);
 
-    pkt_tx.data[0] = 'Q';
-    pkt_tx.data[1] = (uint8_t)('0' + relay_idx_1based);
-    pkt_tx.length  = 2;
+    // Préparer le paquet en clair
+    uint8_t plaintext[2];
+    plaintext[0] = 'Q';
+    plaintext[1] = (uint8_t)('0' + relay_idx_1based);
+
+    // Chiffrer
+    uint8_t ciphertext[16];
+    uint8_t iv[12];
+    uint8_t tag[16];
+    size_t ciphertext_len;
+
+    esp_task_wdt_reset();
+    esp_err_t ret = rf_security_encrypt(plaintext, 2, ciphertext, &ciphertext_len, iv, tag);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SYNC: Encryption failed!");
+        return false;
+    }
+
+    // Construire le paquet
+    memcpy(pkt_tx.data, iv, 12);
+    memcpy(pkt_tx.data + 12, tag, 16);
+    memcpy(pkt_tx.data + 12 + 16, ciphertext, ciphertext_len);
+    pkt_tx.length = 12 + 16 + ciphertext_len;  // Total: 30 bytes
 
     // Réinitialiser le watchdog avant l'opération RF
     esp_task_wdt_reset();
@@ -227,10 +319,11 @@ static bool query_rf_relay_state(uint8_t relay_idx_1based, bool *out_state)
     esp_task_wdt_reset();
     
     if (ok) {
+        // Le paquet est déjà déchiffré dans wait_for_ack
         bool relay_state = (pkt_rx.data[3] == '1');
         *out_state = relay_state;
-        ESP_LOGI(TAG, "SYNC: Relay %u state = %d (RSSI:%d)", 
-                 relay_idx_1based, (int)relay_state, rssi(pkt_rx.rssi));
+        ESP_LOGI(TAG, "SYNC: Relay %u state = %d", 
+                 relay_idx_1based, (int)relay_state);
         // Communication réussie : réinitialiser le compteur d'échecs
         g_comm_failures[idx] = 0;
         g_relay_offline[idx] = false;
@@ -551,6 +644,14 @@ extern "C" void app_main(void)
 
     bool cc1101_initialized = (init_cc1101_from_kconfig() == ESP_OK);
     if (cc1101_initialized) {
+        // Initialiser la sécurité RF
+        if (rf_security_init() != ESP_OK) {
+            ESP_LOGE(TAG, "RF Security initialization failed! Communication will fail.");
+        } else {
+            g_rf_security_initialized = true;
+            ESP_LOGI(TAG, "RF Security (AES-128-GCM) initialized");
+        }
+        
         xTaskCreate(rf_worker_task, "rf_worker", 4096, NULL, 5, NULL);
     }
 

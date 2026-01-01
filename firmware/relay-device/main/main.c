@@ -12,6 +12,7 @@
 #include "driver/gpio.h"
 
 #include <cc1101.h>
+#include "rf_security.h"
 
 static const char *TAG = "RX";
 
@@ -31,6 +32,7 @@ static const gpio_num_t relay_pins[8] = {
 };
 
 static uint8_t relay_state[8] = {0}; // 0=off, 1=on
+static bool g_rf_security_initialized = false;
 
 
 #define NVS_NAMESPACE "relay_states"
@@ -129,12 +131,32 @@ static void relay_init(void)
 
 static void send_ack(uint8_t relay_idx_1based, uint8_t state)
 {
+    // Préparer le paquet en clair
+    uint8_t plaintext[4];
+    plaintext[0] = 'A';
+    plaintext[1] = (uint8_t)('0' + relay_idx_1based);
+    plaintext[2] = ':';
+    plaintext[3] = (uint8_t)(state ? '1' : '0');
+
+    // Chiffrer avec AES-128-GCM
+    uint8_t ciphertext[16];
+    uint8_t iv[12];
+    uint8_t tag[16];
+    size_t ciphertext_len;
+
+    esp_err_t ret = rf_security_encrypt(plaintext, 4, ciphertext, &ciphertext_len, iv, tag);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to encrypt ACK!");
+        return;
+    }
+
+    // Construire le paquet final : IV (12) + Tag (16) + Ciphertext (4)
     CCPACKET ack;
-    ack.data[0] = 'A';
-    ack.data[1] = (uint8_t)('0' + relay_idx_1based);
-    ack.data[2] = ':';
-    ack.data[3] = (uint8_t)(state ? '1' : '0');
-    ack.length = 4;
+    memcpy(ack.data, iv, 12);
+    memcpy(ack.data + 12, tag, 16);
+    memcpy(ack.data + 12 + 16, ciphertext, ciphertext_len);
+    ack.length = 12 + 16 + ciphertext_len;  // Total: 32 bytes
+    
     sendData(ack);
 }
 
@@ -143,6 +165,7 @@ static void rx_task(void *pvParameter)
 {
     ESP_LOGI(TAG, "Start RX task (waiting for set state commands)");
     CCPACKET pkt;
+    uint8_t plaintext[64];  // Buffer pour données déchiffrées
 
     while (1) {
         if (packet_available()) {
@@ -154,14 +177,35 @@ static void rx_task(void *pvParameter)
 
                 ESP_LOGI(TAG, "RX packet len=%d rssi=%ddBm lqi=%d",
                          pkt.length, rssi(pkt.rssi), lqi(pkt.lqi));
-                
 
+                // Vérifier la taille minimale pour un paquet chiffré
+                if (pkt.length < 12 + 16 + 2) {  // IV + Tag + min data
+                    ESP_LOGW(TAG, "Packet too short for encrypted format");
+                    continue;
+                }
+
+                // Extraire IV, Tag et Ciphertext
+                uint8_t *iv = pkt.data;
+                uint8_t *tag = pkt.data + 12;
+                uint8_t *ciphertext = pkt.data + 12 + 16;
+                size_t ciphertext_len = pkt.length - 12 - 16;
+
+                // Déchiffrer
+                size_t plaintext_len;
+                esp_err_t ret = rf_security_decrypt(ciphertext, ciphertext_len,
+                                                   iv, tag, plaintext, &plaintext_len);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "Decryption failed or invalid authentication!");
+                    continue;
+                }
+
+                // Traiter les commandes déchiffrées
                 // Expect "S<digit><0|1>" - Set state command
-                if (pkt.length >= 3 && pkt.data[0] == 'S' && 
-                    pkt.data[1] >= '1' && pkt.data[1] <= '8' &&
-                    (pkt.data[2] == '0' || pkt.data[2] == '1')) {
-                    uint8_t relay = (uint8_t)(pkt.data[1] - '0'); // 1..8
-                    uint8_t target_state = (uint8_t)(pkt.data[2] - '0'); // 0 ou 1
+                if (plaintext_len >= 3 && plaintext[0] == 'S' && 
+                    plaintext[1] >= '1' && plaintext[1] <= '8' &&
+                    (plaintext[2] == '0' || plaintext[2] == '1')) {
+                    uint8_t relay = (uint8_t)(plaintext[1] - '0'); // 1..8
+                    uint8_t target_state = (uint8_t)(plaintext[2] - '0'); // 0 ou 1
                     int idx = (int)relay - 1;
 
                     // Mise à jour directe de l'état (pas de toggle)
@@ -173,23 +217,23 @@ static void rx_task(void *pvParameter)
                     // Sauvegarder l'état dans NVS
                     save_relay_states();
 
-                    // Envoi de l'ACK avec l'état confirmé
+                    // Envoi de l'ACK avec l'état confirmé (déjà chiffré dans send_ack)
                     send_ack(relay, relay_state[idx]);
                 }
                 // Expect "Q<digit>" - Query state command
-                else if (pkt.length >= 2 && pkt.data[0] == 'Q' && 
-                         pkt.data[1] >= '1' && pkt.data[1] <= '8') {
-                    uint8_t relay = (uint8_t)(pkt.data[1] - '0'); // 1..8
+                else if (plaintext_len >= 2 && plaintext[0] == 'Q' && 
+                         plaintext[1] >= '1' && plaintext[1] <= '8') {
+                    uint8_t relay = (uint8_t)(plaintext[1] - '0'); // 1..8
                     int idx = (int)relay - 1;
 
                     // Réponse avec l'état actuel du relais
                     ESP_LOGI(TAG, "Query relay %u -> current state %u", relay, relay_state[idx]);
                     send_ack(relay, relay_state[idx]);
                 } else {
-                    ESP_LOGW(TAG, "Unknown command: len=%d, data[0]=0x%02x('%c')", 
-                             pkt.length, 
-                             pkt.data[0],
-                             (pkt.data[0] >= 32 && pkt.data[0] < 127) ? pkt.data[0] : '?');
+                    ESP_LOGW(TAG, "Unknown command: len=%zu, data[0]=0x%02x('%c')", 
+                             plaintext_len, 
+                             plaintext[0],
+                             (plaintext[0] >= 32 && plaintext[0] < 127) ? plaintext[0] : '?');
                 }
             }
         }
@@ -253,6 +297,14 @@ void app_main(void)
 #elif CONFIG_CC1101_POWER_MAX
     setTxPowerAmp(POWER_MAX);
 #endif
+
+    // Initialiser la sécurité RF
+    if (rf_security_init() != ESP_OK) {
+        ESP_LOGE(TAG, "RF Security initialization failed! Communication will fail.");
+    } else {
+        g_rf_security_initialized = true;
+        ESP_LOGI(TAG, "RF Security (AES-128-GCM) initialized");
+    }
 
     xTaskCreate(&rx_task, "RX", 4096, NULL, 5, NULL);
     

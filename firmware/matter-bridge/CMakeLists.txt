@@ -33,6 +33,7 @@ set(EXTRA_COMPONENT_DIRS
     "${ESP_MATTER_PATH}/components"
     "${ESP_MATTER_PATH}/device_hal/device"
     ../components/cc1101
+    ../components/rf_security
     ${extra_components_dirs_append})
 
 project(matter-bridge)
